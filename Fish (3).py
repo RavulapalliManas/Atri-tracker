@@ -22,7 +22,7 @@ import traceback
 
 # Constants
 MAX_DISTANCE_THRESHOLD = 200 
-PIXEL_TO_METER = 0.000099  
+PIXEL_TO_METER = 0.00025
 VISUALIZATION_FRAME_SKIP = 5
 RETINEX_SIGMA_LIST = [15, 80, 250]  # Multiple scales for MSR
 CLAHE_CLIP_LIMIT = 2.0
@@ -34,9 +34,6 @@ FISH_ASPECT_RATIO_RANGE = (0.3, 3.0)  # Expected fish shape ratio
 MOVEMENT_THRESHOLD = 3  # Lower movement threshold (from 5)
 HISTORY_LENGTH = 10  # Frames to keep in motion history
 
-# Add constants for speed threshold monitoring
-SPEED_THRESHOLD = 0.15  # Speed threshold in m/s to trigger logging
-SPEED_LOGGING_COOLDOWN = 5  # Frames to wait before logging another threshold crossing
 
 
 
@@ -806,12 +803,6 @@ def visualize_processing(original, masked, enhanced, fg_mask, edges, fish_vis, c
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7 * display_scale, (255, 165, 0), 
                     int(max(1, 2 * display_scale)))
         y_pos += 30
-        
-        # Add visual indicator if speed is above threshold
-        if instantaneous_speed > SPEED_THRESHOLD:
-            cv2.putText(display_fish_vis, "THRESHOLD EXCEEDED!", (10, y_pos),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7 * display_scale, (0, 0, 255), 
-                       int(max(1, 2 * display_scale)))
     
     if status_text:
         cv2.putText(display_fish_vis, status_text, (10, 150),
@@ -931,13 +922,6 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
 
     data_filename = os.path.join(video_output_dir, f"fish_data_{video_filename}.csv")
     
-    # Add new output file for speed threshold crossings
-    threshold_filename = os.path.join(video_output_dir, f"speed_threshold_{video_filename}.csv")
-    
-    # Dictionary to store speed threshold crossings
-    speed_threshold_log = {}
-    last_threshold_crossing = 0  # Frame counter for cooldown
-
     with open(data_filename, 'w', newline='') as data_file:
         data_writer = csv.writer(data_file)
         data_writer.writerow(["box_name", "time_spent (s)", "distance_traveled (m)", "average_speed (m/s)"])
@@ -1196,15 +1180,6 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                         if window_time > 0:  # Avoid division by zero
                             cumulative_speed = cumulative_distance * PIXEL_TO_METER / window_time
                 
-                # Log the instantaneous speed if it exceeds the defined threshold and ensure a cooldown period
-                if instantaneous_speed > SPEED_THRESHOLD and (frame_count - last_threshold_crossing) > SPEED_LOGGING_COOLDOWN:
-                    timestamp = frame_count / original_fps  # Convert frame count to time in seconds
-                    speed_threshold_log[timestamp] = instantaneous_speed  # Record the speed at the timestamp
-                    last_threshold_crossing = frame_count  # Update the last crossing frame count
-                    with open(threshold_filename, 'a', newline='') as threshold_file:
-                        threshold_writer = csv.writer(threshold_file)
-                        threshold_writer.writerow([timestamp, instantaneous_speed])  # Log the timestamp and speed
-                
                 if enable_visualization:
                     if visualization_frame_count % VISUALIZATION_FRAME_SKIP == 0:
                         status_text = ""
@@ -1277,18 +1252,10 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                 avg_speed_in_box = distance_in_box / time_spent if time_spent > 0 else 0
                 data_writer.writerow([box_name, time_spent, distance_in_box, avg_speed_in_box])
     
-    # Write speed threshold log to CSV
-    with open(threshold_filename, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp (s)", "speed (m/s)"])
-        for timestamp, speed in sorted(speed_threshold_log.items()):
-            writer.writerow([timestamp, speed])
-    
     print(f"Processing complete for {video_filename}")
     print(f"- Time spent in box: {time_spent:.2f} seconds")
     print(f"- Distance traveled in box: {distance_in_box:.4f} meters")
     print(f"- Average speed in box: {avg_speed_in_box:.4f} m/s")
-    print(f"- {len(speed_threshold_log)} speed threshold crossings logged")
     
     # At the end of process_video function, add plus mode specific data export
 
@@ -1387,7 +1354,7 @@ def analyze_processed_data(output_dir):
         
         # Calculate accuracy percentage based on total time
         # Assuming ideal tracking time is 300 seconds (5 minutes)
-        accuracy_percentage = math.ceil((total_time / 300) * 100)
+        accuracy_percentage = round((total_time / 300) * 100, 2)
         
         mean_speed_overall = total_distance / total_time if total_time > 0 else 0
         
@@ -1585,22 +1552,9 @@ def analyze_processed_data(output_dir):
             ["video_name", video_name],
             ["cumulative_time_spent_total", total_time],
             ["accuracy_percentage", accuracy_percentage],  # Add the accuracy percentage
-            ["cumulative_time_spent_left_box", box_data.get(left_box, {}).get("time_spent", 0) if left_box else 0],
-            ["cumulative_time_spent_right_box", box_data.get(right_box, {}).get("time_spent", 0) if right_box else 0],
-            ["cumulative_time_spent_central_region", box_data.get(central_box, {}).get("time_spent", 0) if central_box else 0],
             ["mean_speed_overall", mean_speed_overall],
-            ["mean_speed_left_box", box_data.get(left_box, {}).get("speed", 0) if left_box else 0],
-            ["mean_speed_right_box", box_data.get(right_box, {}).get("speed", 0) if right_box else 0],
-            ["mean_speed_central_region", box_data.get(central_box, {}).get("speed", 0) if central_box else 0],
             ["overall_distance_travelled", total_distance],
-            ["distance_travelled_left_box", box_data.get(left_box, {}).get("distance", 0) if left_box else 0],
-            ["distance_travelled_right_box", box_data.get(right_box, {}).get("distance", 0) if right_box else 0],
-            ["distance_travelled_central_region", box_data.get(central_box, {}).get("distance", 0) if central_box else 0],
-            ["number_of_visits_left_box", box_visits.get(left_box, 0) if left_box else 0],
-            ["number_of_visits_right_box", box_visits.get(right_box, 0) if right_box else 0],
-            ["number_of_crossings_left_to_right", transition_matrix.get(left_box, {}).get(right_box, 0) if left_box and right_box else 0],
-            ["number_of_crossings_right_to_left", transition_matrix.get(right_box, {}).get(left_box, 0) if left_box and right_box else 0],
-            ["total_box_crossings", sum(crossing.get('to_box') != 'outside' for crossing in crossings)]
+            
         ]
         
         # Add additional crossing metrics to summary
