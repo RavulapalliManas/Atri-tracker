@@ -1,0 +1,7 @@
+
+crop_video.py
+# Ignore all files in the Utilities directory
+Utilities/*
+
+
+__pycache__/*
