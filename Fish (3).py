@@ -21,7 +21,7 @@ import datetime
 import traceback
 
 # Constants
-MAX_DISTANCE_THRESHOLD = 200 
+MAX_DISTANCE_THRESHOLD = 180
 PIXEL_TO_METER = 0.00025
 VISUALIZATION_FRAME_SKIP = 5
 RETINEX_SIGMA_LIST = [15, 80, 250]  # Multiple scales for MSR
@@ -33,6 +33,11 @@ MAX_FISH_AREA = 500  # Also reduce maximum area (from 2000)
 FISH_ASPECT_RATIO_RANGE = (0.3, 3.0)  # Expected fish shape ratio
 MOVEMENT_THRESHOLD = 3  # Lower movement threshold (from 5)
 HISTORY_LENGTH = 10  # Frames to keep in motion history
+
+# Add constants for low mobility detection
+LOW_MOBILITY_THRESHOLD = 0.01  # Speed in m/s below which fish is considered inactive
+LOW_MOBILITY_FRAMES = 20  # Number of consecutive frames with low mobility to trigger an event
+LOW_MOBILITY_DISTANCE = 10  # Pixel distance threshold for considering low mobility
 
 
 
@@ -697,20 +702,25 @@ def apply_tank_mask(frame, mask, scale_factor=1.0):
         
     return cv2.bitwise_and(frame, frame, mask=resized_mask)
 
-def is_fish_movement_valid(current_center, previous_center, previous_valid_center, max_distance):
+def is_fish_movement_valid(current_center, previous_center, previous_valid_center, max_distance, 
+                          movement_history=None, min_history_length=3):
     """
-    Check if fish movement is valid based on distance and consistency.
-
+    Enhanced movement validation with motion history analysis
+    
     Args:
-        current_center (tuple): Current detected position (x, y).
-        previous_center (tuple): Position from the previous frame (x, y).
-        previous_valid_center (tuple): Last known valid position (x, y).
-        max_distance (int): Maximum allowed movement distance in pixels.
-
+        current_center: Current detected position
+        previous_center: Position from previous frame
+        previous_valid_center: Last known valid position
+        max_distance: Maximum allowed movement distance
+        movement_history: List of recent valid movements [(dx, dy), ...]
+        min_history_length: Minimum history length to use for trend analysis
+    
     Returns:
-        tuple: Tuple of (is_valid, center_to_use), where is_valid is a boolean indicating
-               if the movement is valid, and center_to_use is the center to be used.
+        tuple: (is_valid, center_to_use)
     """
+    if movement_history is None:
+        movement_history = []
+        
     if previous_center is None:
         return True, current_center
 
@@ -719,24 +729,60 @@ def is_fish_movement_valid(current_center, previous_center, previous_valid_cente
     dy = current_center[1] - previous_center[1]
     distance = np.sqrt(dx**2 + dy**2)
 
-    # If movement is within threshold, consider it valid
+    # If movement is within normal threshold, consider it valid
     if distance <= max_distance:
+        # Add this movement to history if valid
+        if len(movement_history) >= 10:  # Keep history limited to recent movements
+            movement_history.pop(0)
+        movement_history.append((dx, dy))
         return True, current_center
     
-    # For larger movements, apply additional validation
-    # Using velocity consistency check if we have multiple previous positions
-    if previous_valid_center and previous_center:
-        # Calculate previous movement vector
-        prev_dx = previous_center[0] - previous_valid_center[0]
-        prev_dy = previous_center[1] - previous_valid_center[1]
+    # For larger movements, we need additional validation
+    
+    # Check if movement follows recent trend (if we have enough history)
+    if len(movement_history) >= min_history_length:
+        # Calculate average recent movement vector
+        avg_dx = sum(move[0] for move in movement_history) / len(movement_history)
+        avg_dy = sum(move[1] for move in movement_history) / len(movement_history)
         
-        # Check if current movement is in similar direction (using dot product)
-        if prev_dx * dx + prev_dy * dy > 0 and distance <= max_distance * 1.5:
-            # Movement is in consistent direction, might be valid even if faster
+        # Normalize vectors for direction comparison
+        current_mag = max(0.001, np.sqrt(dx*dx + dy*dy))
+        avg_mag = max(0.001, np.sqrt(avg_dx*avg_dx + avg_dy*avg_dy))
+        
+        norm_dx, norm_dy = dx/current_mag, dy/current_mag
+        norm_avg_dx, norm_avg_dy = avg_dx/avg_mag, avg_dy/avg_mag
+        
+        # Calculate dot product to measure direction similarity (1 = same direction, -1 = opposite)
+        direction_similarity = norm_dx*norm_avg_dx + norm_dy*norm_avg_dy
+        
+        # If movement is in a similar direction and not too much faster than recent average
+        # Allow higher threshold for consistent movements
+        if direction_similarity > 0.7 and distance < max_distance * 1.5:
+            if len(movement_history) >= 10:
+                movement_history.pop(0)
+            movement_history.append((dx, dy))
             return True, current_center
     
-    # Movement failed validation
-    return False, previous_valid_center
+    # If movement is very large, it's likely an error (like a reflection)
+    if distance > max_distance * 2:
+        return False, previous_valid_center
+        
+    # Using Kalman filter or simply the previous valid position + average movement might be better
+    # than using the current position for moderate anomalies
+    if previous_valid_center:
+        predicted_x = previous_valid_center[0]
+        predicted_y = previous_valid_center[1]
+        
+        # We could apply a fraction of the average motion if we have history
+        if len(movement_history) >= min_history_length:
+            avg_dx = sum(move[0] for move in movement_history) / len(movement_history)
+            avg_dy = sum(move[1] for move in movement_history) / len(movement_history)
+            predicted_x += avg_dx * 0.5  # Apply half of average motion as prediction
+            predicted_y += avg_dy * 0.5
+            
+        return False, (int(predicted_x), int(predicted_y))
+    
+    return False, previous_center
 
 def visualize_processing(original, masked, enhanced, fg_mask, edges, fish_vis, current_center, previous_center,
                        distance=None, instantaneous_speed=None, is_valid_movement=True,
@@ -813,11 +859,62 @@ def visualize_processing(original, masked, enhanced, fg_mask, edges, fish_vis, c
 
     return cv2.waitKey(1) & 0xFF
 
-def is_reflection(frame, point):
+def is_reflection(frame, point, region_size=20, brightness_threshold=200, edge_threshold=50):
     """
-    Function modified to disable reflection detection.
-    Always returns False to allow all detections through.
+    Improved reflection detection that checks multiple characteristics of the region
+    
+    Args:
+        frame: Input video frame
+        point: (x, y) coordinates to check
+        region_size: Size of region to analyze around the point
+        brightness_threshold: Threshold for considering a region as bright
+        edge_threshold: Distance from top of frame to consider potential reflection area
+        
+    Returns:
+        bool: True if the region appears to be a reflection
     """
+    h, w = frame.shape[:2]
+    x, y = point
+    
+    # Basic range checks
+    if not (0 <= x < w and 0 <= y < h):
+        return False
+    
+    # Reflections often appear near the top of the tank
+    if y > edge_threshold:
+        return False
+        
+    # Extract region around the point
+    x1 = max(0, x - region_size // 2)
+    y1 = max(0, y - region_size // 2)
+    x2 = min(w, x + region_size // 2)
+    y2 = min(h, y + region_size // 2)
+    
+    if x2 <= x1 or y2 <= y1:
+        return False
+        
+    region = frame[y1:y2, x1:x2]
+    
+    # Check brightness
+    gray_region = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY) if len(region.shape) == 3 else region
+    avg_brightness = np.mean(gray_region)
+    
+    if avg_brightness > brightness_threshold:
+        # Calculate texture information (standard deviation of pixel values)
+        std_dev = np.std(gray_region)
+        
+        # Reflections often have high brightness but low texture variation
+        if std_dev < 15:
+            return True
+            
+    # Look for sharp horizontal edges typical of water surface reflections
+    edges = cv2.Sobel(gray_region, cv2.CV_64F, 0, 1, ksize=3)
+    edges_abs = np.abs(edges)
+    strong_edges = np.mean(edges_abs) > 20
+    
+    if strong_edges and avg_brightness > brightness_threshold * 0.8:
+        return True
+        
     return False
 
 def show_error(message):
@@ -922,11 +1019,20 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
 
     data_filename = os.path.join(video_output_dir, f"fish_data_{video_filename}.csv")
     
+    # Add new output file for low mobility events
+    low_mobility_filename = os.path.join(video_output_dir, f"low_mobility_{video_filename}.csv")
+    
     with open(data_filename, 'w', newline='') as data_file:
         data_writer = csv.writer(data_file)
         data_writer.writerow(["box_name", "time_spent (s)", "distance_traveled (m)", "average_speed (m/s)"])
 
         center_filename = os.path.join(video_output_dir, f"fish_coords_{video_filename}.csv")
+        
+        # Create the low mobility events CSV file
+        with open(low_mobility_filename, 'w', newline='') as low_mobility_file:
+            low_mobility_writer = csv.writer(low_mobility_file)
+            low_mobility_writer.writerow(["start_time (s)", "end_time (s)", "duration (s)", "position_x", "position_y", "in_box"])
+        
         with open(center_filename, 'w', newline='') as center_file:
             center_writer = csv.writer(center_file)
             center_writer.writerow(["frame", "contour_id", "center_x (px)", "center_y (px)", 
@@ -1001,6 +1107,9 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
 
             previous_valid_center = None
             previous_valid_contour = None
+            
+            # Add movement history for improved tracking
+            movement_history = []  # Will store (dx, dy) tuples of recent valid movements
 
             kalman_filter = initialize_kalman_filter(resolution_factor)
             kalman_initialized = False
@@ -1036,6 +1145,16 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                 )
                 kalman_filter = None
                 kalman_initialized = False
+
+            # Add variables for tracking low mobility
+            low_mobility_counter = 0
+            low_mobility_start_frame = 0
+            low_mobility_active = False
+            low_mobility_events = []
+            last_significant_position = None
+            
+            prev_speeds = []  # To store speeds for outlier detection
+            outlier_threshold = 3.0  # Standard deviations for outlier detection
 
             while True:
                 ret, frame = cap.read()
@@ -1123,19 +1242,27 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
 
                         # Remove reflection detection logic
                         if center_y < tank_mask.shape[0] and center_x < tank_mask.shape[1] and tank_mask[center_y, center_x] > 0:
-                            is_valid_movement, center_to_use = is_fish_movement_valid(
-                                current_center,
-                                previous_center,
-                                previous_valid_center if previous_valid_center else current_center,
-                                max_distance_threshold  # Use adjusted threshold
-                            )
+                            # Check if this might be a reflection
+                            is_reflected = is_reflection(frame, current_center)
+                            
+                            if not is_reflected:
+                                is_valid_movement, center_to_use = is_fish_movement_valid(
+                                    current_center,
+                                    previous_center,
+                                    previous_valid_center if previous_valid_center else current_center,
+                                    max_distance_threshold,
+                                    movement_history
+                                )
 
-                            if is_valid_movement:
-                                previous_valid_center = current_center
-                                previous_valid_contour = current_contour
+                                if is_valid_movement:
+                                    previous_valid_center = current_center
+                                    previous_valid_contour = current_contour
+                                else:
+                                    current_center = center_to_use
+                                    is_showing_previous = True
                             else:
-                                current_center = center_to_use
-                                current_contour = previous_valid_contour if previous_valid_contour is not None else current_contour
+                                # This is likely a reflection, use previous position
+                                current_center = previous_valid_center
                                 is_showing_previous = True
                         else:
                             is_outside_tank = True
@@ -1153,8 +1280,26 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                     
                     # Calculate instantaneous speed (pixels per frame to m/s)
                     instantaneous_speed = distance * PIXEL_TO_METER * original_fps
-
-                    # Store current position with frame number
+                    
+                    # Add to speed history for outlier detection
+                    prev_speeds.append(instantaneous_speed)
+                    if len(prev_speeds) > 10:  # Keep a reasonable history
+                        prev_speeds.pop(0)
+                    
+                    # Check if current speed is an outlier
+                    if len(prev_speeds) >= 3:
+                        mean_speed = np.mean(prev_speeds[:-1])  # Mean of previous speeds
+                        std_speed = np.std(prev_speeds[:-1])
+                        
+                        # If current speed is much higher than recent history, it might be an error
+                        if std_speed > 0 and (instantaneous_speed - mean_speed) / std_speed > outlier_threshold:
+                            # This is likely an erroneous detection - adjust the value
+                            instantaneous_speed = mean_speed
+                            # Also adjust the distance for distance calculation
+                            adjusted_distance = mean_speed / (PIXEL_TO_METER * original_fps)
+                            distance = adjusted_distance
+                    
+                    # Update position history with filtered positions
                     position_history.append((frame_count, current_center[0], current_center[1]))
                     
                     # Remove positions older than the window size
@@ -1179,7 +1324,68 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                         window_time = (position_history[-1][0] - position_history[0][0]) / original_fps
                         if window_time > 0:  # Avoid division by zero
                             cumulative_speed = cumulative_distance * PIXEL_TO_METER / window_time
-                
+                    
+                    # Low mobility detection
+                    if distance < LOW_MOBILITY_DISTANCE and instantaneous_speed < LOW_MOBILITY_THRESHOLD:
+                        # Fish is not moving much
+                        if not low_mobility_active:
+                            low_mobility_counter += 1
+                            if low_mobility_counter >= LOW_MOBILITY_FRAMES:
+                                # Start of low mobility event
+                                low_mobility_active = True
+                                low_mobility_start_frame = frame_count
+                                last_significant_position = current_center
+                    else:
+                        # Fish is moving
+                        if low_mobility_active:
+                            # End of low mobility event
+                            low_mobility_active = False
+                            event_duration = (frame_count - low_mobility_start_frame) / original_fps
+                            
+                            # Only log events lasting more than 1 second
+                            if event_duration >= 1.0:
+                                # Find if the fish was in a box during the low mobility
+                                in_box_name = "None"
+                                for box_name, box in box_data.items():
+                                    if is_contour_in_box(current_contour, box):
+                                        in_box_name = box_name
+                                        break
+                                
+                                # Record the low mobility event
+                                low_mobility_events.append({
+                                    'start_time': low_mobility_start_frame / original_fps,
+                                    'end_time': frame_count / original_fps,
+                                    'duration': event_duration,
+                                    'position_x': last_significant_position[0] if last_significant_position else current_center[0],
+                                    'position_y': last_significant_position[1] if last_significant_position else current_center[1],
+                                    'in_box': in_box_name
+                                })
+                                
+                                # Log to file immediately
+                                with open(low_mobility_filename, 'a', newline='') as low_mobility_file:
+                                    low_mobility_writer = csv.writer(low_mobility_file)
+                                    low_mobility_writer.writerow([
+                                        low_mobility_start_frame / original_fps,
+                                        frame_count / original_fps,
+                                        event_duration,
+                                        last_significant_position[0] if last_significant_position else current_center[0],
+                                        last_significant_position[1] if last_significant_position else current_center[1],
+                                        in_box_name
+                                    ])
+                                    
+                            # Reset counter
+                            low_mobility_counter = 0
+                        else:
+                            # Reset counter if there's significant movement
+                            low_mobility_counter = 0
+                    
+                    # Visualization for low mobility (if enabled)
+                    if enable_visualization and fish_vis is not None and low_mobility_active and visualization_frame_count % VISUALIZATION_FRAME_SKIP == 0:
+                        # Add visual indicator for low mobility state
+                        cv2.putText(fish_vis, "LOW MOBILITY DETECTED", (10, fish_vis.shape[0] - 30),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7 * scale_factor, (0, 0, 255), 
+                                  int(max(1, 2 * scale_factor)))
+
                 if enable_visualization:
                     if visualization_frame_count % VISUALIZATION_FRAME_SKIP == 0:
                         status_text = ""
@@ -1221,9 +1427,33 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                                 dy = current_center[1] - prev_box_position[1]
                                 box_distance = np.sqrt(dx**2 + dy**2)
                                 
-                                # Filter out unreasonable movements
-                                if box_distance <= MAX_DISTANCE_THRESHOLD:
+                                # Apply more sophisticated filtering for distance
+                                # Store recent box movements for better filtering
+                                if not hasattr(process_video, 'recent_box_distances'):
+                                    process_video.recent_box_distances = []
+                                
+                                # Check if this distance is reasonable
+                                is_reasonable = True
+                                if len(process_video.recent_box_distances) >= 5:
+                                    # Calculate mean and standard deviation of recent distances
+                                    mean_dist = np.mean(process_video.recent_box_distances)
+                                    std_dist = np.std(process_video.recent_box_distances)
+                                    
+                                    # Use Z-score to detect outliers
+                                    if std_dist > 0:
+                                        z_score = abs(box_distance - mean_dist) / std_dist
+                                        if z_score > 2.5:  # More than 2.5 standard deviations from mean
+                                            # This movement is suspicious
+                                            is_reasonable = False
+                                
+                                # Filter based on traditional threshold and statistical analysis
+                                if box_distance <= MAX_DISTANCE_THRESHOLD and is_reasonable:
                                     distance_in_box += box_distance * PIXEL_TO_METER
+                                    
+                                    # Update recent distances
+                                    process_video.recent_box_distances.append(box_distance)
+                                    if len(process_video.recent_box_distances) > 10:
+                                        process_video.recent_box_distances.pop(0)
                             
                             prev_box_position = current_center
                     
@@ -1256,9 +1486,9 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
     print(f"- Time spent in box: {time_spent:.2f} seconds")
     print(f"- Distance traveled in box: {distance_in_box:.4f} meters")
     print(f"- Average speed in box: {avg_speed_in_box:.4f} m/s")
+    print(f"- {len(low_mobility_events)} low mobility events detected and logged")
     
     # At the end of process_video function, add plus mode specific data export
-
     if plus_mode:
         # Export additional data
         plus_data_filename = os.path.join(video_output_dir, f"plus_mode_data_{video_filename}.csv")
